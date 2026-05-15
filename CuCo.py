@@ -3,6 +3,7 @@ A robust, lightweight, and heavily optimized custom Combobox implementation for 
 applications using ttk.Entry and a detached tk.Toplevel listbox.
 Designed from scratch to fix the layout limitations and styling rigidity of the native ttk.Combobox.
 
+
 Key Features & Optimizations:
     Dynamic Grid Injection:
     Instantiates cleanly using unified geometry redirection (.grid() and .pack()), allowing it to blend
@@ -27,6 +28,15 @@ Key Features & Optimizations:
     Seamless Resize Handling:
     The list will stay in the right position regardless of form resize/restore.
     In addition, if the list will not fit below the text, it will show above provided there is more space.
+    It will also snap to the edge of the monitor if the Entry itself is positioned past the edge of the screen.
+    Supports multiple monitors, however due to the limitations of tk across multiple platforms, these need
+    to be passed in from the project using platform specific methods.
+    If not passed in, the values of the default monitor will be used as a failback which will work on single
+    monitor system and on multi monitor default to just simply showing below the Entry component, the same
+    as if the mid point of the Entry is outside any known monitor.
+    The passed in monitors are expected to be a list of dictionaries with keys of left, top, right, bottom.
+    A ctypes class has been included in the test code below for the purpose of testing on windows.
+
 
 Basic Operation:
     Tab into combo:
@@ -54,21 +64,104 @@ Note:
 
 Lastly:
     Please feel free to use, modify, improve, and repost this as you see fit.
-    
-    Possible improvements:
-    Unmatched multi monitor support for handling the list below or above.
-    Noticed the list being modal when Alt-Tabbing, suggest the ESC key ...
 """
 
 
-#====================================================================================================
-#====================================================================================================
-# ***** class start *****
-#====================================================================================================
-#====================================================================================================
 import tkinter as tk
 from tkinter import ttk, font as tkfont
 
+
+#====================================================================================================
+#====================================================================================================
+# ***** class to get monitors, found on the internet, win32 only *****
+#====================================================================================================
+#====================================================================================================
+import ctypes
+from ctypes import wintypes
+
+
+# 1. Define required Win32 Structs
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ('left', ctypes.c_long),
+        ('top', ctypes.c_long),
+        ('right', ctypes.c_long),
+        ('bottom', ctypes.c_long)
+    ]
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ('cbSize', wintypes.DWORD),
+        ('rcMonitor', RECT),
+        ('rcWork', RECT),
+        ('dwFlags', wintypes.DWORD)
+    ]
+
+# 2. Define the Callback Prototype required by EnumDisplayMonitors
+# Prototype: BOOL CALLBACK MonitorEnumProc(HMONITOR, HDC, LPRECT, LPARAM)
+MONITORENUMPROC = ctypes.WINFUNCTYPE(
+    wintypes.BOOL, 
+    wintypes.HMONITOR, 
+    wintypes.HDC, 
+    ctypes.POINTER(RECT), 
+    wintypes.LPARAM
+)
+
+def win32_get_monitors():
+    """Queries Windows OS directly to fetch exact virtual monitor dimensions."""
+    monitors_list = []
+
+    if root.tk.call('tk', 'windowingsystem') != 'win32': return monitors_list # added in case of testing on non-win32
+
+    # Make the call High-DPI Aware to prevent Windows from virtualizing/lying about sizes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2) # Per-monitor DPI aware
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware() # Fallback for older Windows systems
+        except Exception:
+            pass
+
+    def enum_callback(hMonitor, hdcMonitor, lprcMonitor, lParam):
+        # Initialize the info struct with its own byte size
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        
+        # Populate the struct via the active monitor handle
+        if ctypes.windll.user32.GetMonitorInfoW(hMonitor, ctypes.byref(mi)):
+            r = mi.rcMonitor
+            w = r.right - r.left
+            h = r.bottom - r.top
+            
+            monitors_list.append({
+                'left': r.left,
+                'top': r.top,
+                'right': r.right,
+                'bottom': r.bottom,
+                'width': w,
+                'height': h
+            })
+        return True  # Return True to keep enumerating next monitors
+
+    # Trigger enumeration across the Windows user32 subsystem
+    callback_instance = MONITORENUMPROC(enum_callback)
+    ctypes.windll.user32.EnumDisplayMonitors(None, None, callback_instance, 0)
+    
+    return monitors_list
+#====================================================================================================
+#====================================================================================================
+# ***** monitor class end *****
+#====================================================================================================
+#====================================================================================================
+
+
+
+
+#====================================================================================================
+#====================================================================================================
+# ***** custom combo class start *****
+#====================================================================================================
+#====================================================================================================
 class CuCo:
     def __init__(self, 
                  parent: tk.Widget, 
@@ -78,7 +171,8 @@ class CuCo:
                  intArrowSize: int = 14, 
                  intListRows: int = 5, 
                  lstListValues: list = None, 
-                 blnValidate: bool = True):
+                 blnValidate: bool = True,
+                 lstMonitors: list = None):
 
         # Validation & Root Setup
         if parent is None: raise ValueError("CuCo requires a parent.")
@@ -93,8 +187,7 @@ class CuCo:
         self.intListRows = intListRows or 5
         self.lstListValues = lstListValues if lstListValues is not None else []
         self.blnValidate = blnValidate if blnValidate is not None else True
-
-        self.intScreenHeight = self.root.winfo_screenheight()
+        self.lstMonitors = lstMonitors or [{'left': 0, 'top': 0, 'right': self.root.winfo_screenwidth(), 'bottom': self.root.winfo_screenheight()}]
 
         # Variable Initialization - Placeholders
         self.lstValuesSorted = []
@@ -104,23 +197,128 @@ class CuCo:
         
         self.lstBindings = []
 
-        self.winDD_Visible = False
+        self.blnWinVisible = False
         self.blnNoKeyUp = False
         self.blnFirstShow = True
         self.blnComboActive = False
 
-        self.winDD = None
+        self.win = None
         self.sb = None
         self.lb = None
-        self.winDD_height = 0
+        self.intWinHeight = 0
 
-        # Create the Main Entry (txtCombo)
-        self.txtCombo = ttk.Entry(parent, style=self.strStyle, width=self.intTextWidth, font=self.tplFont)
-        self.txtCombo.bind("<FocusIn>", self.fShowDD, add='+')
-        self.txtCombo.bind('<ButtonRelease-1>', self.button_release, add='+')
-        self.txtCombo.bind('<KeyPress>', self.key_down, add='+')
-        self.txtCombo.bind('<KeyRelease>', self.key_up, add='+')
-        self.txtCombo.bind("<FocusOut>", self.focus_out, add='+')
+        # Create the Main Entry (txt)
+        self.txt = ttk.Entry(parent, style=self.strStyle, width=self.intTextWidth, font=self.tplFont)
+        self.txt.bind("<FocusIn>", self.txt_focus_in, add='+')
+        self.txt.bind('<ButtonRelease-1>', self.txt_mouse_up, add='+')
+        self.txt.bind('<KeyPress>', self.key_down, add='+')
+        self.txt.bind('<KeyRelease>', self.key_up, add='+')
+        self.txt.bind("<FocusOut>", self.focus_out, add='+')
+#====================================================================================================
+    def dropdown_create(self):
+        # Create the Dropdown Window (Toplevel)
+        self.win = tk.Toplevel(self.root)
+        self.win.withdraw()
+        self.win.wm_attributes('-topmost', True)
+        self.win.wm_overrideredirect(True)
+
+        # Style the scrollbar
+        ttk.Style(self.win).theme_use('clam')
+        ttk.Style(self.win).configure('winDD.Vertical.TScrollbar', arrowsize=self.intArrowSize)
+
+        # Create Scrollbar
+        self.sb = ttk.Scrollbar(self.win, orient=tk.VERTICAL, style='winDD.Vertical.TScrollbar', command=self.sb_scroll)
+        self.sb.pack(side='right', fill='y')
+
+        # Create List
+        self.SVlstValuesSorted = tk.StringVar(value=self.lstValuesSorted)
+        self.lb = tk.Listbox(self.win,
+                        listvariable=self.SVlstValuesSorted,
+                        font=self.tplFont, borderwidth=1, relief="solid", 
+                        activestyle='none', selectbackground='#0078d7',
+                        takefocus=True, exportselection=False,
+                        selectmode="single",
+                        yscrollcommand=self.sb.set)
+        self.lb.pack(side="left", fill="both", expand=True)
+
+        # Bindings for the Dropdown components
+        self.lb.bindtags((str(self.win), str(self.lb)))
+        self.lb.bind('<Button-1>', self.lb_mouse_down)
+        self.lb.bind('<MouseWheel>', self.mouse_scroll)     # Windows & macOS
+        self.lb.bind('<Button-4>', self.mouse_scroll)       # Linux Scroll Up
+        self.lb.bind('<Button-5>', self.mouse_scroll)       # Linux Scroll Down
+        self.win.bind('<KeyPress>', self.key_down)
+        self.win.bind('<KeyRelease>', self.key_up)
+        self.win.bind('<FocusOut>', self.focus_out)
+        self.win.bind('<Destroy>', self.win_on_destroy)
+
+        self.blnComboActive = False
+#====================================================================================================
+    def txt_focus_in(self, e):
+        if self.win is None: self.dropdown_create()
+
+        if self.blnComboActive: return
+
+        # Refresh list data and set associated values
+        self.lstValuesSorted = sorted(self.lstListValues, key=str.casefold) if self.lstListValues else ['-- None --']
+        self.SVlstValuesSorted.set(self.lstValuesSorted)
+        self.intValuesCount = len(self.lstValuesSorted)
+        self.intListLines = min(self.intListRows, self.intValuesCount)
+        self.dictNavigate = {'Up': -1, 'Down': 1, 'Prior': -self.intListLines, 'Next': self.intListLines}
+
+        # Set window height here rather than in dropdown_create in case new list has fewer items than original List Lines
+        self.lb.config(height=self.intListLines)
+        self.win.update_idletasks()
+        self.intWinHeight = self.win.winfo_reqheight()
+
+        self.blnWinVisible = False # keeps track of window state, deiconify/withdraw  
+        self.blnNoKeyUp = False    # used by key_down to tell key_up to not do anuthing
+        self.blnFirstShow = True   # handle (first key up event when tabbing) or (first mouse up when clicking) into txt
+        self.blnComboActive = True # allows for navigation between txt and winDD
+
+        # Setup root window sync bindings (destroyed in focus_out)
+        self.lstBindings = [
+            (self.root, '<Button-1>', self.root.bind('<Button-1>',self.root_mouse_down, add='+')),
+            (self.root, '<Configure>', self.root.bind('<Configure>', self.root_configure, add='+'))
+        ]
+#====================================================================================================
+    def root_mouse_down(self, e=None):
+        if self.blnWinVisible and self.win and self.win.winfo_exists():
+            self.win.withdraw(); self.blnWinVisible = False
+#====================================================================================================
+    def root_configure(self, e):
+        if self.blnWinVisible and (e.widget == self.root) and self.win and self.win.winfo_exists():
+            self.win.withdraw(); self.blnWinVisible = False
+#====================================================================================================
+    def dropdown_show(self):
+        x = self.txt.winfo_rootx()
+        y = self.txt.winfo_rooty()
+        w = self.txt.winfo_width()
+        h = self.txt.winfo_height()
+        xc = x + (w // 2)
+        yc = y + (h // 2)
+
+        xx = x
+        yy = y + h
+        
+        m = next((m for m in self.lstMonitors if m['left'] <= xc <= m['right'] and m['top'] <= yc <= m['bottom']), None)
+        if m:
+            # Top/Bottom
+            if (yy + self.intWinHeight) > m['bottom']:
+                space_below = m['bottom'] - yy
+                space_above = y - m['top']
+                if space_above > space_below:
+                    yy = y - self.intWinHeight
+
+            # Left/Right
+            if xx < m['left']:
+                xx = m['left']
+            elif (xx + w) > m['right']:
+                xx = m['right'] - w
+
+        self.win.wm_geometry(f'{w}x{self.intWinHeight}+{xx}+{yy}')
+        
+        self.win.deiconify(); self.blnWinVisible = True
 #====================================================================================================
     def mouse_scroll(self, e):
         if self.lb and self.lb.winfo_exists():
@@ -135,97 +333,8 @@ class CuCo:
                 direction = -1 if e.delta > 0 else 1
                 self.lb.yview_scroll(direction, "units")
             return "break" # Prevents double-scrolling bugs
-
-    def MakeDD(self):
-        # Create the Dropdown Window (Toplevel)
-        self.winDD = tk.Toplevel(self.root, name='cucowindd')
-        self.winDD.withdraw()
-        self.winDD.wm_attributes('-topmost', True)
-        self.winDD.wm_overrideredirect(True)
-
-        # Style the scrollbar
-        ttk.Style(self.winDD).theme_use('clam')
-        ttk.Style(self.winDD).configure('winDD.Vertical.TScrollbar', arrowsize=self.intArrowSize)
-
-        # Create Scrollbar
-        self.sb = ttk.Scrollbar(self.winDD, orient=tk.VERTICAL, style='winDD.Vertical.TScrollbar', command=self.scrollbar_scroll)
-        self.sb.pack(side='right', fill='y')
-
-        # Create List
-        self.SVlstValuesSorted = tk.StringVar(value=self.lstValuesSorted)
-        self.lb = tk.Listbox(self.winDD,
-                        listvariable=self.SVlstValuesSorted,
-                        font=self.tplFont, borderwidth=1, relief="solid", 
-                        activestyle='none', selectbackground='#0078d7',
-                        takefocus=True, exportselection=False,
-                        selectmode="single",
-                        yscrollcommand=self.sb.set)
-        self.lb.pack(side="left", fill="both", expand=True)
-
-        # Bindings for the Dropdown components
-        self.lb.bindtags((str(self.winDD), str(self.lb)))
-        self.lb.bind('<Button-1>', self.item_clicked)
-        self.lb.bind('<MouseWheel>', self.mouse_scroll)     # Windows & macOS
-        self.lb.bind('<Button-4>', self.mouse_scroll)       # Linux Scroll Up
-        self.lb.bind('<Button-5>', self.mouse_scroll)       # Linux Scroll Down
-        self.winDD.bind('<KeyPress>', self.key_down)
-        self.winDD.bind('<KeyRelease>', self.key_up)
-        self.winDD.bind('<FocusOut>', self.focus_out)
-        self.winDD.bind('<Destroy>', self.on_destroy)
-
-        self.blnComboActive = False
 #====================================================================================================
-    def fShowDD(self, e):
-        if self.winDD is None: self.MakeDD()
-
-        if self.blnComboActive: return
-
-        # Refresh list data and set associated values
-        self.lstValuesSorted = sorted(self.lstListValues, key=str.casefold) if self.lstListValues else ['-- None --']
-        self.SVlstValuesSorted.set(self.lstValuesSorted)
-        self.intValuesCount = len(self.lstValuesSorted)
-        self.intListLines = min(self.intListRows, self.intValuesCount)
-        self.dictNavigate = {'Up': -1, 'Down': 1, 'Prior': -self.intListLines, 'Next': self.intListLines}
-
-        # Set window height here rather than in MakeDD in case new list has fewer items than original List Lines
-        self.lb.config(height=self.intListLines)
-        self.winDD.update_idletasks()
-        self.winDD_height = self.winDD.winfo_reqheight()
-
-        # Resize and position DD window
-        self.update_position()
-
-        self.winDD_Visible = False # used by sync_windows 
-        self.blnNoKeyUp = False    # used by key_down to tell key_up to not do anuthing
-        self.blnFirstShow = True   # handle (first key up event when tabbing) or (first mouse up when clicking) into txtCombo
-        self.blnComboActive = True # allows for navigation between txtCombo and winDD
-
-        # Setup root window sync bindings (destroyed in focus_out)
-        self.lstBindings = [
-            (self.root, '<Unmap>', self.root.bind('<Unmap>', self.sync_windows, add='+')),
-            (self.root, '<Map>', self.root.bind('<Map>', self.sync_windows, add='+')),
-            (self.root, '<Configure>', self.root.bind('<Configure>', self.update_position, add='+'))
-        ]
-#====================================================================================================
-    def update_position(self, e=None):
-        if e and e.widget != self.root: return
-
-        x = self.txtCombo.winfo_rootx()
-        y = self.txtCombo.winfo_rooty()
-        z = self.txtCombo.winfo_width()
-        
-        yy = y + self.txtCombo.winfo_height()
-        if (yy + self.winDD_height) > self.intScreenHeight:
-            if y > (self.intScreenHeight - yy): yy = y - self.winDD_height
-            
-        self.winDD.wm_geometry(f'{z}x{self.winDD_height}+{x}+{yy}')
-#====================================================================================================
-    def sync_windows(self, e):
-        if e.widget == self.root:
-            if e.type == tk.EventType.Unmap: self.winDD.withdraw()
-            elif e.type == tk.EventType.Map and self.winDD_Visible: self.winDD.deiconify()
-#====================================================================================================
-    def scrollbar_scroll(self, *args):
+    def sb_scroll(self, *args):
         try:
             if len(args) > 2 and args[0] == 'scroll' and args[2] == 'pages':
                 self.lb.yview(max(0, self.lb.index('@0,0') + (int(args[1]) * self.intListLines)))
@@ -239,31 +348,31 @@ class CuCo:
         strPrefix = strPrefix.casefold()
         return next((i for i, s in enumerate(self.lstValuesSorted) if s.casefold().startswith(strPrefix)), -1)
 #====================================================================================================
-    def listbox_move_to(self, intIndex):
+    def lb_move_to(self, intIndex):
         self.lb.selection_clear(0, tk.END)
         self.lb.activate(intIndex)
         self.lb.selection_set(intIndex)
         self.lb.yview(max(0, intIndex - (self.intListLines // 2)))
 #====================================================================================================
-    def item_clicked(self, e=None):
+    def lb_mouse_down(self, e=None):
         intIndex = self.lb.nearest(e.y) if e else self.lb.index('active')
-        self.txtCombo.delete(0, tk.END)
-        self.txtCombo.insert(0, self.lstValuesSorted[intIndex])
-        self.winDD.withdraw(); self.winDD_Visible = False
+        self.txt.delete(0, tk.END)
+        self.txt.insert(0, self.lstValuesSorted[intIndex])
+        self.win.withdraw(); self.blnWinVisible = False
 #====================================================================================================
     def key_down(self, e):
-        if self.winDD and self.winDD.winfo_exists():
+        if self.win and self.win.winfo_exists():
             match e.keysym:
-                case 'Return' if self.winDD.winfo_viewable():
-                    self.item_clicked()
+                case 'Return' if self.blnWinVisible:
+                    self.lb_mouse_down()
                     self.blnNoKeyUp = True
                     return 'break'
 
-                case 'Tab' if self.winDD.winfo_viewable():
-                    if self.txtCombo.get():
-                        self.item_clicked()
+                case 'Tab' if self.blnWinVisible:
+                    if self.txt.get():
+                        self.lb_mouse_down()
 
-                    oFocusNext = self.txtCombo.tk_focusNext()
+                    oFocusNext = self.txt.tk_focusNext()
                     if oFocusNext:
                         oFocusNext.focus_set()
 
@@ -271,120 +380,139 @@ class CuCo:
                     return 'break'
 
                 case 'Escape':
-                    self.winDD.withdraw(); self.winDD_Visible = False
+                    self.win.withdraw(); self.blnWinVisible = False
                     self.blnNoKeyUp = True
                     return 'break'
 
                 case 'Up' | 'Down' | 'Prior' | 'Next':
-                    if self.winDD.winfo_viewable():
+                    if self.blnWinVisible:
                         new_idx = max(0, min(self.lb.index(tk.ACTIVE) + self.dictNavigate[e.keysym], self.intValuesCount - 1))
-                        self.listbox_move_to(new_idx)
+                        self.lb_move_to(new_idx)
                     else:
                         self.key_up()
-                        self.winDD.deiconify(); self.winDD_Visible = True
+                        self.dropdown_show()
 
                     self.blnNoKeyUp = True
                     return 'break'
             
-            if e.widget in (self.winDD, self.lb):
+            if e.widget in (self.win, self.lb):
                 match e.keysym:
                     case 'BackSpace':
-                        intCursorPosition = self.txtCombo.index(tk.INSERT)
+                        intCursorPosition = self.txt.index(tk.INSERT)
                         if intCursorPosition > 0:
-                            self.txtCombo.delete(intCursorPosition - 1)
+                            self.txt.delete(intCursorPosition - 1)
                         return 'break'
 
                     case 'Delete':
-                        intCursorPosition = self.txtCombo.index(tk.INSERT)
-                        self.txtCombo.delete(intCursorPosition)
+                        intCursorPosition = self.txt.index(tk.INSERT)
+                        self.txt.delete(intCursorPosition)
                         return 'break'
 
                     case _ if e.char and e.char.isprintable():
-                        self.txtCombo.insert(tk.INSERT, e.char)
+                        self.txt.insert(tk.INSERT, e.char)
                         return 'break'
 #====================================================================================================
     def key_up(self, e=None):
-        if self.winDD and self.winDD.winfo_exists():
+        if self.win and self.win.winfo_exists():
             if self.blnNoKeyUp: self.blnNoKeyUp = False; return
             
-            strPrefix = self.txtCombo.get()
+            strPrefix = self.txt.get()
             intNewIndex = 0 if not strPrefix else self.get_list_index(strPrefix)
-            self.listbox_move_to(max(0, intNewIndex))
+            self.lb_move_to(max(0, intNewIndex))
             
             if self.blnFirstShow:
                 self.blnFirstShow = False
             elif e:
                 if intNewIndex == -1:
-                    self.winDD.withdraw(); self.winDD_Visible = False
+                    self.win.withdraw(); self.blnWinVisible = False
                 else:
-                    if self.txtCombo.index(tk.INSERT) == self.txtCombo.index(tk.END):
+                    if self.txt.index(tk.INSERT) == self.txt.index(tk.END):
                         if strPrefix.casefold() == self.lstValuesSorted[intNewIndex].casefold():
-                            self.txtCombo.delete(0, tk.END)
-                            self.txtCombo.insert(0, self.lstValuesSorted[intNewIndex])
+                            self.txt.delete(0, tk.END)
+                            self.txt.insert(0, self.lstValuesSorted[intNewIndex])
 
-                    self.winDD.deiconify(); self.winDD_Visible = True
+                    if not self.blnWinVisible: self.dropdown_show()
 #====================================================================================================
-    def button_release(self, e):
-        if self.winDD and self.winDD.winfo_exists():
+    def txt_mouse_up(self, e):
+        if self.win and self.win.winfo_exists():
             if self.blnFirstShow:
                 self.blnFirstShow = False
 
             self.key_up()
-            if self.txtCombo.index(tk.INSERT) == self.txtCombo.index(tk.END):
-                self.winDD.deiconify(); self.winDD_Visible = True
+            if self.txt.index(tk.INSERT) == self.txt.index(tk.END):
+                if not self.blnWinVisible: self.dropdown_show()
             else:
-                self.winDD.withdraw(); self.winDD_Visible = False
+                self.win.withdraw(); self.blnWinVisible = False
 #====================================================================================================
-    def focus_out(self, e):
-        if self.root.focus_get() in (None, self.txtCombo):
-            return
+    def focus_out_after_idle(self):
+        oNewFocusWidget = self.root.focus_get()
 
-        if self.winDD: self.winDD.withdraw(); self.winDD_Visible = False
-        
-        if self.blnValidate:
-            strPrefix = self.txtCombo.get()
-            intIndex = self.get_list_index(strPrefix)
-            if intIndex == -1 or strPrefix != self.lstValuesSorted[intIndex]:
-                self.txtCombo.delete(0, tk.END)
+        if oNewFocusWidget == None:
+            if self.blnWinVisible and self.win and self.win.winfo_exists():
+                self.win.withdraw(); self.blnWinVisible = False
+            
+        elif (oNewFocusWidget == self.txt) or (oNewFocusWidget.winfo_toplevel() == self.win):
+            pass
 
-        for oWidget, strEvent, strID in self.lstBindings:
-            try: oWidget.unbind(strEvent, strID)
-            except: pass
-        self.lstBindings = []
-        
-        self.blnComboActive = False
-        self.txtCombo.selection_clear()
-#====================================================================================================
-    def on_destroy(self, e):
-        if e.widget == self.winDD:
+        else:
+            if self.blnWinVisible and self.win and self.win.winfo_exists():
+                self.win.withdraw(); self.blnWinVisible = False
+
+            if self.blnValidate:
+                strPrefix = self.txt.get()
+                intIndex = self.get_list_index(strPrefix)
+                if intIndex == -1 or strPrefix != self.lstValuesSorted[intIndex]:
+                    self.txt.delete(0, tk.END)
+
             for oWidget, strEvent, strID in self.lstBindings:
                 try: oWidget.unbind(strEvent, strID)
                 except: pass
             self.lstBindings = []
-
-            self.winDD = None
+            
+            self.blnComboActive = False
+            self.txt.selection_clear()
+#====================================================================================================
+    def focus_out(self, e):
+        self.win.after_idle(self.focus_out_after_idle)
+#====================================================================================================
+    def win_on_destroy(self, e):
+        if e.widget == self.win:
+            self.win = None
+            
+            for oWidget, strEvent, strID in self.lstBindings:
+                try: oWidget.unbind(strEvent, strID)
+                except: pass
+            self.lstBindings = []
 #====================================================================================================
     def get(self):
-        return self.txtCombo.get()
+        return self.txt.get()
 #====================================================================================================
     def set(self, value):
-        self.txtCombo.delete(0, tk.END)
-        self.txtCombo.insert(0, value)
+        self.txt.delete(0, tk.END)
+        self.txt.insert(0, value)
 #====================================================================================================
     def delete(self, first, last=tk.END):
-        self.txtCombo.delete(first, last)
+        self.txt.delete(first, last)
 #====================================================================================================
     def grid(self, **kwargs):
-        self.txtCombo.grid(**kwargs)
+        self.txt.grid(**kwargs)
 #====================================================================================================
     def pack(self, **kwargs):
-        self.txtCombo.pack(**kwargs)
+        self.txt.pack(**kwargs)
 #====================================================================================================
 #====================================================================================================
-# ***** class end *****
+# ***** custom combo class end *****
 #====================================================================================================
 #====================================================================================================
 
+
+
+
+#====================================================================================================
+#====================================================================================================
+# ***** test script below *****
+#====================================================================================================
+#====================================================================================================
 root = tk.Tk()
 root.state('zoomed')
 
@@ -406,14 +534,14 @@ animals = [
     'Fox', 'Giraffe', 'Goat', 'Horse', 'Kangaroo', 'Lion', 'Monkey', 'Panda', 'Penguin',
     'Rabbit', 'Shark', 'Tiger', 'Whale', 'Wolf', 'Aardvark']
 
-
+lstMonitors = win32_get_monitors()
 
 
 #-----
 ttk.Label(root, text='freestyle, choose or type anything you want:', style='Base.TLabel', width=71).grid(row=0, column=0, columnspan=2, sticky='w', padx=(10, 0))
 
 ttk.Label(root, text='Combo 1:', style='Base.TLabel', width=10).grid(row=1, column=0, sticky='w', padx=(10, 0))
-myCuCo1 = CuCo(root, tplFont, 'Base.TEntry', 60, 22, 5, countries, False) # all arguments passed positionally
+myCuCo1 = CuCo(root, tplFont, 'Base.TEntry', 60, 22, 5, countries, False) # all arguments passed positionally, lstMonitors not supplied
 myCuCo1.grid(row=1, column=1, sticky='w', padx=(10, 0))
 myCuCo1.set('yesterday was a rainy day')
 #-----
@@ -422,12 +550,13 @@ root.rowconfigure(2, minsize=50)
 frame1 = ttk.Frame(root, padding='0')
 frame1.grid(row=3, column=0, columnspan=2, sticky='nsew')
 
-ttk.Label(frame1, text='combo with default font/style and data validation, packed in a frame:', style='Base.TLabel', width=71).pack(side='left', padx=(10, 0))
+ttk.Label(frame1, text='combo with default font/style and data validation, packed in a frame,', style='Base.TLabel', width=71).pack(side='top', padx=(10, 0))
+ttk.Label(frame1, text='monitors passed in, now repositions at edges of multiple monitors:', style='Base.TLabel', width=71).pack(side='top', padx=(10, 0))
 
 frame2 = ttk.Frame(root, padding='0')
 frame2.grid(row=4, column=0, columnspan=2, sticky='nsew')
 ttk.Label(frame2, text='Combo 2:', style='Base.TLabel', width=10).pack(side='left', padx=(10, 0))
-myCuCo2 = CuCo(frame2, None, None, 10, 14, 8, animals, True) # arguments passed positionally but using None for default values
+myCuCo2 = CuCo(frame2, None, None, 10, 14, 8, animals, True, lstMonitors) # arguments passed positionally but using None for default values
 myCuCo2.pack(side='left', padx=(10, 0))
 myCuCo2.set(myCuCo2.lstListValues[0])
 #-----
